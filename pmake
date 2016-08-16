@@ -1,0 +1,508 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+use Getopt::Std;
+
+#$0 =~ s|^(.*/)?([^/]+)/*$|$2|;
+
+
+
+#use getopt to scan 
+#-d debug
+#-n print commands
+#-f Makefile: run Makefile 
+
+my %OPTS;
+getopts("dnf", \%OPTS);
+
+my $debug_flag = (exists $OPTS{"d"})? 1:0;
+my $noexe_flag = (exists $OPTS{"n"})? 1:0;
+my $make_flag = (exists $OPTS{"f"})? 1:0;
+
+ 
+
+ my $argc = @ARGV;
+ my $filename  = ' ';
+ my $alltarget = ' ';
+ if ($argc == 0){ #no specific filename
+    $filename = "Makefile";
+  }elsif($argc == 1){
+   my $s = shift;
+   if ($s =~ /Makefile/){ #has specific Makefile name
+      $filename = $s;
+     }else{
+      $filename = "Makefile";
+      
+      $alltarget = $s;
+      }
+    }elsif($argc == 2){
+      my $s = shift;
+      my $tmp = shift;
+      if ($s =~ /Makefile/){
+         $filename = $s;
+         $alltarget = $tmp;
+      }else{
+
+      print " enter wrong command! \n";
+     }
+    }     
+     
+   #no specific Makefile name, but has filename
+ 
+ #open Makefile and read each line
+ sub debug($){
+    my $in = shift;
+    if($debug_flag){
+      print "$in \n";
+     }
+  }
+
+
+
+  sub runComUnder($){
+    my ($com, $term_signal, $core_dumped, $status_ign,
+         $in, $exit_status);
+      $in = shift;
+     print "$in \n";
+    $status_ign = 0;
+    debug("Running Command: $in\n");
+    if($in =~ m/^-/){
+      $in =~ s/^-\s//;
+      $status_ign = 1;
+      debug("Command Error ignor!\n");
+      }
+     
+     my $out = system($in);
+     my $outState = $?;
+     $term_signal = $? & 0x7F;
+     $core_dumped = $? & 0x80;
+     $exit_status = ($? >> 8) & 0xFF;
+     if($outState != 0){
+       debug("Return State: $outState ");
+       debug("Term Signal: $term_signal ");
+       debug("Core Dump: $core_dumped");
+       debug("Exit Status: $exit_status");
+     }
+     if($exit_status != 0){
+         if($term_signal){
+         print"make:Error  $term_signal \n";
+         exit($exit_status);
+         }
+         print"make:Error:   $exit_status \n ";
+         exit($exit_status); 
+        }
+
+ }  
+
+
+#***************************  macro  ********************** 
+ #push key value into macro hash table
+ my %macro;
+ my %target;
+ my %command;
+ my $finTaret; 
+ my @seqrun;
+ my @seqcom;
+ sub macroGet($){ #get value from hash
+   my $key = shift;
+   my $val = $macro{$key} or die("ERR: MACRO $key NOT FOUND");
+   return $val;
+  }
+
+ sub macroPush($$){ #push key value into hash
+   my $key  = shift;
+   my $val  = shift; 
+   $macro{ $key } = $val;
+  }
+ 
+ #given a macro, find its replacement from macro hash
+ sub macroFind ($){
+  my $in = shift;
+  my $val = $in;
+  while($in =~ m/(\${[^}]+})/g) {
+    my ($in_macro, $out_macro);
+    $in_macro = $1;
+    $in_macro =~ m/([^\${}]+)/;
+    $out_macro = macroGet($1);
+    $in_macro =~ s/\$/\\\$/g;
+    $val =~ s/$in_macro/$out_macro/e;
+   }
+  return $val;
+ }
+
+ sub macroReplace($){#replace macro
+    my $key;
+    for $key (keys %macro){
+      my @input = split / /, $macro{$key};
+      foreach (@input) { 
+        my $macEle = $_;
+        if ($_ =~ /\$\{/){
+            $_ = macroFind ($macEle);
+          } 
+        }     
+      $macro{$key} = join(' ', @input); 
+    }
+ 
+  }
+#given a target macro, find its replacement from macro hash
+#need modification.
+sub targetMacFind($$){
+  my ($index, $in_macro, $out_macro, $val, $tmp);
+  $index    = shift;
+  $in_macro = shift;
+  $val      = $in_macro;
+  my %current = %{$target{$index}}; 
+  while($in_macro =~ m/(\$@|\$\^|\$<)/g){
+    $tmp = $1;
+    if($tmp eq "\$@"){
+      $out_macro = $index; 
+     } elsif($tmp eq "\$^"){
+     }elsif ($tmp eq "\$<"){
+     } else{
+       die("ERR! ");
+     }
+  $tmp =~ s/\$/\\\$/g;
+  $val =~ s/$tmp/$out_macro/e;
+  }
+}
+
+
+#***************************  targets  ********************** 
+
+#handle case ci : ${CHECKIN}
+sub targetPush($$$){
+  #token each line push to target hash
+  my $line = shift;
+  my $var = shift;
+  my $comd = shift;
+  my $comdcp = $comd;
+  if ($line =~ /\$\{/ ){
+    $line = macroFind ($line);
+  }
+  my @input = split / /, $var;
+  foreach (@input){
+    my $macEle = $_;
+    if($_ =~ /\$\{/){
+       $_ = macroFind ($macEle);
+      } 
+   }
+  $var = join (' ', @input);
+  my @command = split / /, $comd;
+  foreach (@command){
+    my $ele = $_;
+    if($_ =~ /\$\{/){ # command contain ${}
+       $_ = macroFind ($ele);
+      }
+   }
+  $comd = join (' ', @command);
+  $target{$line}{$var} = $comd; 
+  
+  
+  
+}
+
+
+ 
+#given a key, check it exist in target hash or not
+#if yes, return the value, if no, return 0 
+ sub targetFind($){
+   my $in = shift;
+   foreach my $key (sort keys %target) {
+    foreach my $subele (keys %{ $target{$key} }) {
+       if($key eq $in){
+        return $subele;
+       }
+     }
+   }
+     return ' ';
+ }
+
+ #given a key, find the command in target hash
+ sub targetComFind($){
+  my $in = shift;
+  foreach my $key (sort keys %target) {
+    foreach my $subele (keys %{ $target{$key} }) {
+       if($key eq $in){
+          return $target{$key}{$subele} ;
+       }
+     }
+   }
+     return ' ';
+ }
+
+ 
+
+ # traval the target and build the runing sequence
+ sub runtarget($){
+   my $in = shift;
+   my $tmp = targetFind($in);
+   if ($tmp eq ' '){ return;}
+   my @arry = split / /, $tmp;
+   foreach(@arry) { push @seqrun, $_; }
+    
+   push @seqrun,$in;
+   foreach (@arry){
+      $tmp = targetFind($_);
+      if($tmp eq ' '){ return;}
+      else { 
+        @arry = split / /, $tmp;
+        foreach(@arry) { unshift @seqrun, $_; 
+          }
+       }
+   }
+   
+ }
+
+ 
+ #build command sequence
+ sub commandseq(){
+   
+  foreach (@seqrun){
+    my $tmp = targetComFind($_);
+    push @seqcom, $tmp;
+    }
+ }
+
+ sub runCommand(){
+  foreach (@seqcom){
+    $_ =~ s/\s//;
+    if($_){
+      my @comarry = split /\n/, $_;
+      foreach(@comarry){
+        my $cmd = $_;
+        $cmd =~ s/^\s//;
+        runComUnder($cmd);
+      }
+    }
+   }
+ }
+ 
+ #add more element into target. remove %.XXX
+ #replace by new
+ sub expendTarget($$$$) {
+   my $keyrep = shift;
+   my $valrep = shift;
+   my $list   = shift;
+   my $comd   = shift;
+   my @element;
+   if($list){
+     @element = split / /, $list;
+   }
+   my $keycp = $keyrep;
+   $keyrep =~ s/\%\.//;  $valrep =~ s/\%\.//;
+   foreach(@element){
+      my $tmp = $_;
+      if($tmp =~ /$valrep/){
+         $tmp =~ s/$valrep/$keyrep/;
+         if($comd =~ /\$\</){
+            $comd =~ s/\$\</$_/g;
+         }
+         print " $tmp   $_  $comd  \n";
+         $target{$tmp}{$_} = $comd;        
+     }
+   }
+  }
+
+
+ #search macro with the given value. yes return true, no
+ #return false.
+ sub searchMacroValue($){
+   my $in = shift;
+   foreach (keys %macro){
+     my $tmp = $macro{$_};
+     if ($tmp =~ /$in/){
+        return 1;
+      }
+    }
+    return 0;
+  }
+ 
+ #given apart of value, find it inside macro or not
+ #if yes, return the full value. if no, return empty
+ #if more than one exist, return all of them that found
+ sub searchMacro($){
+   my $in = shift;
+   my $incopy = $in;
+   my $tmp = ' ';
+   my $out = ' ';
+   $in =~ s/\%\.//;
+   foreach (keys %macro){
+    $tmp = $macro{$_};
+    if ($tmp =~ /$in/){
+      $out .=  $tmp;
+      $out .= ' ';
+    }
+   }
+   return $out;
+ }
+
+ # given array and a value, check after substitute the array
+ # with the value, the new element exist in macro or not
+ # if new element exist, return them. if not return empty
+ sub checkMacro($$$){
+   my $in = shift;      my $incp = $in;
+   my $out = shift;     my $outcp = $out;
+   my $list = shift;    my $listcp = $list;
+   my @element = split / /, $list;
+   my $found;
+   $in =~ s/\%\.//; $out =~ s/\%\.//;   
+   foreach(@element){
+     if($_ =~ /$in/){
+       $_ =~ s/$in/$out/;
+       if(searchMacroValue($_)){
+         $found .= $_ .' ' ;
+           
+       }
+     }
+   }
+   return $found;
+  }
+#replace %.o: %.c 
+  sub subtarget(){
+   my $keyrep=' ';
+   my $valrep=' '; 
+   my $comrep=' ';
+   # find replace key and val
+   foreach my $ele (keys %target){
+      foreach my $subele (keys %{ $target{$ele}}) {
+         if($ele =~ /\%/){
+            $keyrep = $ele;
+            $valrep = $subele;
+            $comrep = $target{$ele}{$subele}; 
+        }
+      }
+   }
+  my $keyrepcp = $keyrep;
+  my $valrepcp = $valrep;
+  #test $keyrep inside macro or not
+  my $result1  = searchMacro($keyrep); 
+  my $result2  = checkMacro($keyrep, $valrep, $result1);
+  expendTarget($keyrep, $valrep, $result2, $comrep);  
+  $keyrep =~ s/\%\.//;
+  $valrep =~ s/\%\.//;
+  foreach my $ele (keys %target){
+      foreach my $subele (keys %{ $target{$ele}}) {
+       if(($ele =~ /$keyrep$/) && ($ele !~ /\%/)){
+         my $tmp = $ele;
+         
+         $tmp =~ s/$keyrep$/$valrep/;
+         if ($tmp eq $subele) {
+           delete $target{$keyrepcp};
+           $keyrep = ' '; $keyrepcp = ' ';
+           $valrep = ' '; $valrepcp = ' ';
+           $comrep = ' ';
+        }
+      }
+    }
+  }
+  if ($keyrep eq ' '){ return; }
+  #replace key doesn't exit in target. replace it  
+  foreach my $ele (keys %target){
+      foreach my $subele (keys %{ $target{$ele}}) {
+         if (($ele =~ /$keyrep$/) && ($ele !~ /\%/)){
+           my $tmp = $ele;
+           if($comrep =~ /\%/){#command contain %.
+              my $newtmp = $ele;
+              $newtmp =~ s/\..//;
+              $comrep =~ s/\%/$newtmp/g; 
+            }
+           $tmp =~ s/$keyrep$/$valrep/;
+           if($tmp ne $subele) {
+              
+              $target{$ele}{$tmp} = $comrep;             
+              delete $target{$keyrepcp};           
+          }
+        }  
+       }
+     }
+
+  } 
+
+
+#*******************************************************
+  #separete the input into macro, target, substitute
+ my $macrott  =  qr/[\w\d\.\%\$\{\}^\t]*/;
+ my $macrocc  =  qr/[\w\d\.\\\%\$\{\}\*\|\<\>\-_=,+;:?\/ ]+/;
+ my $macroexp = qr/(${macrott}) *= *(${macrocc})/;
+ my $macroid  =  qr/\$\{(${macrott})\}/;
+ my $targethh = qr/\n(${macrott}) *\: *((${macrott} *)*)/;
+ my $targetb  =  qr/((\n\t${macrocc}*)*)/;
+ my $targetex = qr/${targethh}${targetb}/;
+ my $targetp = 
+    qr/\n((%\.(.+)) *\: *(%\.(.+)))((\n\t(.*))*)/;
+ sub processInput($){
+   my $cont = shift;
+   $cont =~ s/.*#.*//;  #remove commend    
+   $cont =~ s/\n+/\n/g; #remove empty line
+   $cont =~ s/\$\$/\$/g; #replace $$ with $
+   my $first = 0;   
+
+   while ($cont =~ m/\n${macroexp}/g){
+     macroPush( $1, $2 );
+    } 
+    macroReplace(%macro);
+   
+   while ($cont =~ m/${targetex}/g){
+      if ($first == 0 ){
+          $finTaret = $1;
+          if( $alltarget ne ' '){
+             $finTaret = $alltarget;
+           }  
+        }
+      targetPush($1,$2, $4);
+      $first = 1+$first;
+    }
+  }
+
+ sub openfile($){
+    my $filename = shift;
+    my $content;
+    open (my $file, "<$filename")
+       or die "Could't open $filename: $!\n";
+    while(<$file>){ $content .= $_; }
+    close $file;
+    return $content;
+ }
+ 
+ my $cont = openfile ($filename);
+
+
+ processInput($cont);
+ debug( "error message!");
+ subtarget();
+ runtarget($finTaret);
+# foreach (@seqrun){print " **** $_ ******* \n";} 
+ debug( "error!");
+ commandseq(); 
+# print "##################################### \n";
+# foreach (@seqcom){print "XXX$_ XXXXX ";}
+  runCommand(); 
+#  print "-------------------------------------\n";
+#  print "$_ $macro{$_}\n" for (keys %macro);
+#  print "-------------------------------------\n";
+#   print "-****------------------------------------\n";
+#   foreach my $ele (keys %target){
+#     foreach my $subele (keys %{ $target{$ele}}) {
+#        print "$ele: $subele: $target{$ele}{$subele} \n";
+#     }
+#   }
+
+   #print "$_:  $target{$_}\n" for (keys %target);
+   #print "-***------------------------------------\n"; 
+#   print "-------------------------------------\n";
+   #print "$_:  $command{$_}\n" for (keys %command);
+   #print "-------------------------------------\n";
+
+
+
+#         runCom $line;
+    #print $macro{EXECBIN},"\n";
+   # print "$_ +++    $macro{$_}\n" for (keys %macro); 
+
+
+
+
+
+
